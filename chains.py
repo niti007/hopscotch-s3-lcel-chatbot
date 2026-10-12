@@ -54,6 +54,7 @@ from prompts import (
     POLICY_REPLY_PROMPT,
     TRIAGE_PROMPT,
 )
+from jev import DEFAULT_JEV_MODEL, build_jev_triage_runnable
 
 ORDER_VALUE_LIMIT = 5000  # policy Section 4: orders above INR 5,000 need a human
 
@@ -242,6 +243,7 @@ def decide_route(x: dict) -> dict:
         summary += f"; order_value=INR {value}"
 
     return {
+        "chat_history": [],
         **x,  # keep input, chat_history, signals for the branch prompts
         "category": category,
         "priority": priority,
@@ -324,6 +326,74 @@ def build_greeting_chains(llm):
     piped = prompt | llm | StrOutputParser()
     explicit = RunnableSequence(first=prompt, middle=[llm], last=StrOutputParser())
     return piped, explicit
+
+
+# =========================================================================== #
+# 6b. Jev-powered Decision Pipelines (System One)
+# =========================================================================== #
+
+
+def build_signals_jev(jev_model: str = DEFAULT_JEV_MODEL):
+    """Signals pipeline using TypeSafe Jev for category, priority, and safety decisions."""
+    jev_runnable = build_jev_triage_runnable(model=jev_model)
+
+    def _combine_signals(inputs: dict) -> dict:
+        jev_res = inputs["jev"]
+        return {
+            "triage": jev_res.get("triage", {}),
+            "safety": jev_res.get("safety", {}),
+            "order_value": inputs.get("order_value"),
+            "order_id": inputs.get("order_id"),
+            "jev_metadata": {
+                "probabilities": jev_res.get("probabilities", {}),
+                "latency_s": jev_res.get("latency_s", 0.0),
+                "cost": jev_res.get("cost", 0.0),
+                "tokens": jev_res.get("tokens", 0),
+            },
+        }
+
+    return (
+        RunnableParallel(
+            jev=jev_runnable,
+            order_value=RunnableLambda(extract_order_value),
+            order_id=RunnableLambda(extract_order_id),
+        )
+        | RunnableLambda(_combine_signals)
+    )
+
+
+def build_full_chain_jev(llm, jev_model: str = DEFAULT_JEV_MODEL):
+    """Full pipeline using Jev for decision nodes, LLM for downstream text generation only."""
+    text_only = RunnableLambda(lambda x: x["input"] if isinstance(x, dict) else str(x))
+    ensure_history = RunnableLambda(
+        lambda x: {**x, "chat_history": x.get("chat_history", [])}
+        if isinstance(x, dict)
+        else {"input": str(x), "chat_history": []}
+    )
+    return (
+        ensure_history
+        | RunnablePassthrough.assign(signals=text_only | build_signals_jev(jev_model))
+        | RunnableLambda(decide_route)
+        | build_route_branch(llm)
+    )
+
+
+def explain_route_jev(text: str, jev_model: str = DEFAULT_JEV_MODEL) -> dict:
+    """Run Jev signals + decide_route (no LLM reply generation) for benchmark comparison."""
+    start = time.perf_counter()
+    signals = build_signals_jev(jev_model).invoke(text)
+    decision = decide_route({"input": text, "signals": signals})
+    return {
+        "route": decision["route"],
+        "needs_human": decision["needs_human"],
+        "human_reasons": decision["human_reasons"],
+        "category": decision["category"],
+        "priority": decision["priority"],
+        "triage_summary": decision["triage_summary"],
+        "signals": signals,
+        "latency_s": round(time.perf_counter() - start, 3),
+        "jev_metadata": signals.get("jev_metadata", {}),
+    }
 
 
 # =========================================================================== #

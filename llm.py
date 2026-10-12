@@ -6,10 +6,11 @@ just a different model-name string - nothing else in the app changes.
 """
 import os
 
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-load_dotenv()  # reads OPENROUTER_API_KEY from a local .env file (ignored by git)
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "openai/gpt-4o-mini"
