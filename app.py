@@ -4,14 +4,22 @@ import os
 import time
 import uuid
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 import chains
 from chains import (
     SAMPLE_EXPECTED, SAMPLE_TICKETS, build_bot, build_enrichment_pipeline, build_full_chain,
-    build_greeting_chains, build_route_branch, build_signals, decide_route, enrich_with_order_id, explain_route,
+    build_full_chain_jev, build_greeting_chains, build_route_branch, build_signals,
+    build_signals_jev, decide_route, enrich_with_order_id, explain_route, explain_route_jev,
     quick_filter,
+)
+from jev import (
+    DEFAULT_JEV_MODEL,
+    calculate_jev_cost,
+    calculate_llm_cost,
+    estimate_tokens,
 )
 from llm import DEFAULT_MODEL, get_llm
 from prompts import DEFECT_PROMPT, ESCALATION_PROMPT, GENERAL_PROMPT, POLICY_REPLY_PROMPT
@@ -57,6 +65,14 @@ with st.sidebar:
         st.rerun()
     facilitator = st.toggle("🛠️ Facilitator mode: show internal triage", value=False,
                             help="Adds one extra LLM call per turn to show the routing decision.")
+    st.divider()
+    st.header("⚡ Decision Engine")
+    jev_model_id = st.text_input(
+        "TypeSafe Jev Model",
+        value=DEFAULT_JEV_MODEL,
+        help="System 1 structured decision model via OpenRouter Decisions API",
+    )
+    st.caption("Jev Pricing: **$0.042 / 1M in**, **$0 / out**")
 
 sid = st.session_state.session_id
 try:
@@ -84,7 +100,9 @@ def render_debug(info: dict):
         ]))
 
 
-tab_chat, tab_pipe, tab_lab = st.tabs(["💬 Chat", "🔗 Pipeline", "🧪 Runnables lab"])
+tab_chat, tab_pipe, tab_lab, tab_jev = st.tabs([
+    "💬 Chat", "🔗 Pipeline", "🧪 Runnables lab", "⚡ Jev Decision Lab"
+])
 
 # ------------------------------------------------------------------ tab 1: chat
 with tab_chat:
@@ -266,3 +284,294 @@ build_signals = RunnableParallel(triage=..., safety=..., order_value=..., order_
                        "call, so the gap is small - with several LLM steps it would be large.")
         except Exception as e:  # noqa: BLE001
             st.error(str(e))
+
+# ------------------------------------------------------------------ tab 4: jev decision lab
+with tab_jev:
+    st.subheader("⚡ Jev Decision Lab - LLM vs Decision Model Comparison")
+    st.markdown(
+        "Decision models (**System 1**) evaluate typed questions over application state without "
+        "generating free-form text tokens. This eliminates output token latency and costs while providing "
+        "calibrated probability distributions. Downstream customer replies are still handled by the LLM (**System 2**)."
+    )
+
+    info_c1, info_c2 = st.columns(2)
+    with info_c1:
+        st.info(
+            f"**LLM Triage (`{DEFAULT_MODEL}`)**\n\n"
+            "- Generative completion parsed defensively\n"
+            "- Pricing: $0.15 / 1M input | $0.60 / 1M output\n"
+            "- Deterministic keyword regex for safety checks"
+        )
+    with info_c2:
+        st.success(
+            f"**TypeSafe Jev (`{jev_model_id}`)**\n\n"
+            "- Structured decisions: `choice` (category), `score` (priority), `noul` (safety)\n"
+            "- Pricing: **$0.042 / 1M input | $0.00 output** (Zero generation cost)\n"
+            "- Returns calibrated probability distributions"
+        )
+
+    st.markdown("### 1. Interactive Single-Ticket Benchmark")
+    sample_key = st.selectbox("Choose sample ticket or type below:", list(SAMPLE_TICKETS), key="jev_sample_sel")
+    custom_ticket = st.text_area("Ticket Text", SAMPLE_TICKETS[sample_key], height=110, key="jev_ticket_text")
+
+    if st.button("Compare Decision Nodes (LLM vs Jev)", key="btn_compare_single"):
+        with st.spinner("Running LLM triage and TypeSafe Jev decisions..."):
+            try:
+                # 1. LLM run
+                t0_llm = time.perf_counter()
+                llm_info = explain_route(custom_ticket, llm)
+                llm_time = time.perf_counter() - t0_llm
+                llm_in_tok = estimate_tokens(custom_ticket) + 120  # prompt overhead ~120 tokens
+                llm_out_tok = 15  # "category,priority" ~15 tokens
+                llm_cost = calculate_llm_cost(llm_in_tok, llm_out_tok)
+
+                # 2. Jev run
+                t0_jev = time.perf_counter()
+                jev_info = explain_route_jev(custom_ticket, jev_model=jev_model_id)
+                jev_time = time.perf_counter() - t0_jev
+                jev_in_tok = estimate_tokens(custom_ticket)
+                jev_cost = calculate_jev_cost(jev_in_tok)
+
+                # Summary metrics
+                m1, m2, m3, m4 = st.columns(4)
+                speedup = f"{llm_time / max(jev_time, 0.001):.1f}x" if jev_time > 0 else "N/A"
+                cost_saving = f"{(1 - (jev_cost / max(llm_cost, 0.0000001))) * 100:.1f}%"
+                match_str = "✅ Match" if llm_info["route"] == jev_info["route"] else "⚠️ Differ"
+
+                m1.metric("LLM Latency", f"{llm_time:.2f}s")
+                m2.metric(
+                    "Jev Latency",
+                    f"{jev_time:.2f}s",
+                    delta=f"{speedup} faster" if jev_time < llm_time else "slower",
+                )
+                m3.metric("LLM Cost", f"${llm_cost:.6f}")
+                m4.metric("Jev Cost", f"${jev_cost:.6f}", delta=f"-{cost_saving}", delta_color="inverse")
+
+                col_llm, col_jev = st.columns(2)
+                with col_llm:
+                    st.markdown(f"#### LLM Route: {ROUTE_BADGES.get(llm_info['route'], llm_info['route'])}")
+                    st.write(f"- **Category:** `{llm_info['category']}`")
+                    st.write(f"- **Priority:** `{llm_info['priority']}`")
+                    st.write(f"- **Safety Flag (Regex):** `{llm_info['signals']['safety']['flag']}`")
+                    st.write(f"- **Estimated Cost:** `${llm_cost:.6f}` ({llm_in_tok} in / {llm_out_tok} out tokens)")
+                    if llm_info["human_reasons"]:
+                        st.caption(f"Reasons: {', '.join(llm_info['human_reasons'])}")
+
+                with col_jev:
+                    st.markdown(f"#### Jev Route: {ROUTE_BADGES.get(jev_info['route'], jev_info['route'])}")
+                    st.write(f"- **Category (Choice):** `{jev_info['category']}`")
+                    st.write(f"- **Priority (Score):** `{jev_info['priority']}`")
+                    st.write(f"- **Safety (Noul):** `{jev_info['signals']['safety']['flag']}`")
+                    st.write(f"- **Estimated Cost:** `${jev_cost:.6f}` ({jev_in_tok} in / 0 out tokens)")
+
+                    probs = jev_info["signals"].get("jev_metadata", {}).get("probabilities", {})
+                    if probs.get("category"):
+                        st.caption("Category Probabilities:")
+                        st.json(probs["category"])
+                    if probs.get("priority"):
+                        st.caption("Priority Probabilities:")
+                        st.json(probs["priority"])
+
+                with st.expander("Downstream reply generation test (LLM generates reply based on Jev route)"):
+                    st.caption("Notice: Jev strictly decided the route; the actual reply text is generated by the LLM:")
+                    branch_llm = build_route_branch(llm)
+                    routed_jev = decide_route({"input": custom_ticket, "chat_history": [], "signals": jev_info["signals"]})
+                    reply_text = branch_llm.invoke(routed_jev)
+                    st.info(reply_text)
+
+            except Exception as err:
+                st.error(f"Comparison failed: {err}")
+
+    st.divider()
+    st.markdown("### 2. Batch Benchmark Across All Sample Tickets")
+    st.caption("Compare speed, cost, and routing consistency across all predefined test cases.")
+
+    if st.button("Run Batch Benchmark (All 6 Samples)", key="btn_batch_jev"):
+        names, texts = list(SAMPLE_TICKETS), list(SAMPLE_TICKETS.values())
+        progress = st.progress(0)
+        rows = []
+        total_llm_time = 0.0
+        total_jev_time = 0.0
+        total_llm_cost = 0.0
+        total_jev_cost = 0.0
+
+        for idx, (name, text) in enumerate(zip(names, texts)):
+            progress.progress((idx + 1) / len(names))
+            try:
+                # LLM
+                t0 = time.perf_counter()
+                l_info = explain_route(text, llm)
+                l_time = time.perf_counter() - t0
+                l_in = estimate_tokens(text) + 120
+                l_cost = calculate_llm_cost(l_in, 15)
+
+                # Jev
+                t0 = time.perf_counter()
+                j_info = explain_route_jev(text, jev_model=jev_model_id)
+                j_time = time.perf_counter() - t0
+                j_in = estimate_tokens(text)
+                j_cost = calculate_jev_cost(j_in)
+
+                total_llm_time += l_time
+                total_jev_time += j_time
+                total_llm_cost += l_cost
+                total_jev_cost += j_cost
+
+                exp_route = SAMPLE_EXPECTED.get(name, "unknown")
+                rows.append({
+                    "Ticket": name,
+                    "Expected": ROUTE_BADGES.get(exp_route, exp_route),
+                    "LLM Route": ROUTE_BADGES.get(l_info["route"], l_info["route"]),
+                    "Jev Route": ROUTE_BADGES.get(j_info["route"], j_info["route"]),
+                    "Agree?": "✅ Yes" if l_info["route"] == j_info["route"] else "⚠️ No",
+                    "LLM Time (s)": round(l_time, 2),
+                    "Jev Time (s)": round(j_time, 2),
+                    "LLM Cost ($)": f"${l_cost:.6f}",
+                    "Jev Cost ($)": f"${j_cost:.6f}",
+                })
+            except Exception as e:
+                rows.append({
+                    "Ticket": name,
+                    "Expected": ROUTE_BADGES.get(SAMPLE_EXPECTED.get(name, ""), ""),
+                    "LLM Route": "Error",
+                    "Jev Route": f"Error: {e}",
+                    "Agree?": "❌",
+                    "LLM Time (s)": 0,
+                    "Jev Time (s)": 0,
+                    "LLM Cost ($)": "$0",
+                    "Jev Cost ($)": "$0",
+                })
+
+        st.session_state["batch_results"] = {
+            "rows": rows,
+            "total_llm_time": total_llm_time,
+            "total_jev_time": total_jev_time,
+            "total_llm_cost": total_llm_cost,
+            "total_jev_cost": total_jev_cost,
+            "avg_llm_cost": total_llm_cost / max(len(names), 1),
+            "avg_jev_cost": total_jev_cost / max(len(names), 1),
+            "avg_llm_time": total_llm_time / max(len(names), 1),
+            "avg_jev_time": total_jev_time / max(len(names), 1),
+        }
+
+    if "batch_results" in st.session_state:
+        bdata = st.session_state["batch_results"]
+        rows = bdata["rows"]
+        total_llm_time = bdata["total_llm_time"]
+        total_jev_time = bdata["total_jev_time"]
+        total_llm_cost = bdata["total_llm_cost"]
+        total_jev_cost = bdata["total_jev_cost"]
+        avg_llm_cost = bdata["avg_llm_cost"]
+        avg_jev_cost = bdata["avg_jev_cost"]
+        avg_llm_time = bdata["avg_llm_time"]
+        avg_jev_time = bdata["avg_jev_time"]
+
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        b1, b2, b3 = st.columns(3)
+        latency_diff = total_jev_time - total_llm_time
+        speedup_factor = (
+            f"{total_llm_time / max(total_jev_time, 0.001):.1f}x faster"
+            if total_jev_time <= total_llm_time
+            else f"{total_jev_time / max(total_llm_time, 0.001):.1f}x slower"
+        )
+        b1.metric(
+            "Total Latency",
+            f"Jev: {total_jev_time:.2f}s",
+            delta=f"{latency_diff:+.2f}s ({speedup_factor}) vs LLM ({total_llm_time:.2f}s)",
+            delta_color="inverse",
+        )
+        b2.metric(
+            "Total Decision Cost",
+            f"Jev: ${total_jev_cost:.6f}",
+            delta=f"-{(1 - total_jev_cost / max(total_llm_cost, 1e-9)) * 100:.1f}% vs LLM (${total_llm_cost:.6f})",
+            delta_color="inverse",
+        )
+        agreed_count = sum(1 for r in rows if "✅" in r.get("Agree?", ""))
+        b3.metric("Decision Agreement", f"{agreed_count}/{len(rows)} ({agreed_count / len(rows) * 100:.0f}%)")
+
+        st.divider()
+        st.markdown("### 3. Projected Scale & Growing Comparison")
+        st.caption("Extrapolate growing costs and processing time from 1,000 to 1,000,000 production tickets.")
+
+        if st.button("📈 Project Cost & Time at Scale", key="btn_project_scale"):
+            vol_steps = [int(10_000 + (1_000_000 - 10_000) * i / 34) for i in range(35)]
+            max_cost_llm = max(1_000_000 * avg_llm_cost * 1.05, 1.0)
+            max_time_llm = max(((1_000_000 * avg_llm_time) / 3600) * 1.05, 0.1)
+
+            chart_c1, chart_c2 = st.columns(2)
+            with chart_c1:
+                st.markdown("#### Cumulative Cost Projection ($)")
+                cost_ph = st.empty()
+            with chart_c2:
+                st.markdown("#### Cumulative Time Projection (Hours)")
+                time_ph = st.empty()
+
+            cost_data = []
+            time_data = []
+
+            for v in vol_steps:
+                cost_data.extend([
+                    {"Tickets": v, "Cost": round(v * avg_llm_cost, 2), "Model": f"LLM ({DEFAULT_MODEL})"},
+                    {"Tickets": v, "Cost": round(v * avg_jev_cost, 2), "Model": f"Jev ({jev_model_id})"},
+                ])
+                time_data.extend([
+                    {"Tickets": v, "Hours": round((v * avg_llm_time) / 3600, 2), "Model": f"LLM ({DEFAULT_MODEL})"},
+                    {"Tickets": v, "Hours": round((v * avg_jev_time) / 3600, 2), "Model": f"Jev ({jev_model_id})"},
+                ])
+
+                chart_cost = (
+                    alt.Chart(pd.DataFrame(cost_data))
+                    .mark_line(interpolate="monotone", strokeWidth=3.5)
+                    .encode(
+                        x=alt.X("Tickets:Q", scale=alt.Scale(domain=[0, 1_000_000]), title="Ticket Volume", axis=alt.Axis(format="~s")),
+                        y=alt.Y("Cost:Q", scale=alt.Scale(domain=[0, max_cost_llm]), title="Total Cost ($)", axis=alt.Axis(format="$,.0f")),
+                        color=alt.Color(
+                            "Model:N",
+                            scale=alt.Scale(
+                                domain=[f"LLM ({DEFAULT_MODEL})", f"Jev ({jev_model_id})"],
+                                range=["#ff4b4b", "#00c08b"],
+                            ),
+                            legend=alt.Legend(orient="bottom", title=None),
+                        ),
+                    )
+                    .properties(height=320)
+                )
+
+                chart_time = (
+                    alt.Chart(pd.DataFrame(time_data))
+                    .mark_line(interpolate="monotone", strokeWidth=3.5)
+                    .encode(
+                        x=alt.X("Tickets:Q", scale=alt.Scale(domain=[0, 1_000_000]), title="Ticket Volume", axis=alt.Axis(format="~s")),
+                        y=alt.Y("Hours:Q", scale=alt.Scale(domain=[0, max_time_llm]), title="Compute Time (Hours)", axis=alt.Axis(format=",.0f")),
+                        color=alt.Color(
+                            "Model:N",
+                            scale=alt.Scale(
+                                domain=[f"LLM ({DEFAULT_MODEL})", f"Jev ({jev_model_id})"],
+                                range=["#ff4b4b", "#00c08b"],
+                            ),
+                            legend=alt.Legend(orient="bottom", title=None),
+                        ),
+                    )
+                    .properties(height=320)
+                )
+
+                cost_ph.altair_chart(chart_cost, use_container_width=True)
+                time_ph.altair_chart(chart_time, use_container_width=True)
+                time.sleep(0.02)
+
+            p100_llm_cost = 100_000 * avg_llm_cost
+            p100_jev_cost = 100_000 * avg_jev_cost
+            p100_saved = p100_llm_cost - p100_jev_cost
+            p100_llm_hrs = (100_000 * avg_llm_time) / 3600
+            p100_jev_hrs = (100_000 * avg_jev_time) / 3600
+            p100_hrs_saved = p100_llm_hrs - p100_jev_hrs
+
+            st.success(
+                f"**At 100,000 Tickets Scale:**\n\n"
+                f"- **Cost:** LLM ${p100_llm_cost:,.2f} ➔ Jev **${p100_jev_cost:,.2f}** "
+                f"(Saves **${p100_saved:,.2f}**, {((1 - p100_jev_cost / max(p100_llm_cost, 1e-9)) * 100):.1f}% reduction)\n"
+                f"- **Compute Time:** LLM {p100_llm_hrs:.1f} hrs ➔ Jev **{p100_jev_hrs:.1f} hrs** "
+                f"(Saves **{p100_hrs_saved:.1f} hours** of compute)"
+            )
+
